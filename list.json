@@ -181,6 +181,16 @@
             "des": "每日问候。\n指令：,everyday_greet"
         },
         {
+            "name": "ip",
+            "version": "1.0",
+            "section": "daily",
+            "maintainer": "outlook84",
+            "size": "1.82 kb",
+            "supported": true,
+            "des_short": "查询 IP 地址信息。",
+            "des": "### IP 查询\n\n使用 ip2location.io 提供的 API 查询 IP 地址信息。\n\n**使用方法:** `.ip <ip>`"
+        },
+        {
             "name": "listusernames",
             "version": "1.01",
             "section": "daily",
@@ -251,6 +261,16 @@
             "des": "命令：resou\n\n- resou zhihu\n- resou wb\n- resou dy\n- resou baidu\n- resou b\n- resou tt"
         },
         {
+            "name": "speedtest",
+            "version": "1.0",
+            "section": "daily",
+            "maintainer": "outlook84",
+            "size": "2.04 kb",
+            "supported": true,
+            "des_short": "使用 speedtest-cli 测试当前服务器的网络速度。",
+            "des": "# Speedtest\n\n使用 speedtest-cli 测试当前服务器的网络速度。"
+        },
+        {
             "name": "tel",
             "version": "1.131",
             "section": "daily",
@@ -292,13 +312,13 @@
         },
         {
             "name": "ytdl",
-            "version": "2.0",
+            "version": "2.1",
             "section": "chat",
             "maintainer": "xtaodada",
-            "size": "8.06 kb",
+            "size": "9.06 kb",
             "supported": true,
             "des_short": "基于 `yt-dlp`，从各种网站下载视频或音频。",
-            "des": "## yt-dlp\n\n基于 `yt-dlp`，从 YouTube 等网站下载视频或音频。\n\n- `ytdl <链接/关键词>`: 下载视频\n- `ytdl m <链接/关键词>`: 下载音频"
+            "des": "## yt-dlp\n\n基于 `yt-dlp`，从 YouTube 等网站下载视频或音频。\n\n- `ytdl <链接/关键词>`: 下载视频\n- `ytdl m <链接/关键词>`: 下载音频\n- `ytdl update`: 更新 yt-dlp"
         }
     ]
 }
