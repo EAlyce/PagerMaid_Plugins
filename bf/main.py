@@ -8,8 +8,10 @@ import re
 import tempfile
 import secrets
 
+from pagermaid.hook import Hook
 from pagermaid.listener import listener
 from pagermaid.enums import Message
+from pagermaid.services import bot, scheduler
 
 # 统一时区：北京（UTC+8）
 BJ_TZ = datetime.timezone(datetime.timedelta(hours=8), name="UTC+8")
@@ -17,12 +19,6 @@ BJ_TZ = datetime.timezone(datetime.timedelta(hours=8), name="UTC+8")
 
 def now_bj():
     return datetime.datetime.now(BJ_TZ)
-
-
-# 全局变量：用于定时任务
-_cron_task = None
-_last_client = None  # 捕获最近一次命令的 client 以便定时任务使用
-_last_cron_minute_done = None  # 避免同一分钟重复触发
 
 
 # 持久化确认机制
@@ -196,7 +192,7 @@ def _parse_cron_field(field: str, min_v: int, max_v: int):
 
 
 def _cron_matches(now: datetime.datetime, expr: str) -> bool:
-    """判断当前时间是否匹配5段 cron: m h dom mon dow"""
+    """判断当前时间是否匹配5段 cron: m h dom mon dow (标准cron语义)"""
     try:
         fields = expr.split()
         if len(fields) != 5:
@@ -205,18 +201,25 @@ def _cron_matches(now: datetime.datetime, expr: str) -> bool:
         h_set = _parse_cron_field(fields[1], 0, 23)
         dom_set = _parse_cron_field(fields[2], 1, 31)
         mon_set = _parse_cron_field(fields[3], 1, 12)
-        dow_set = _parse_cron_field(fields[4], 0, 6)  # 0=周日（cron 语义）
+        dow_set = _parse_cron_field(fields[4], 0, 6)  # 0=周日（cron语义）
 
         # Python: Monday=0..Sunday=6
-        # 我们约定 cron 的 DOW: 0=周日..6=周六，因此做一次映射：py_dow->cron_dow
         cron_dow = (now.weekday() + 1) % 7  # Monday(0)->1, ..., Sunday(6)->0
+
+        dom_match = now.day in dom_set
+        dow_match = cron_dow in dow_set
+
+        # 标准cron语义：day-of-month 与 day-of-week 之间是 OR 关系
+        if dom_set != set(range(1, 32)) and dow_set != set(range(0, 7)):
+            day_ok = dom_match or dow_match
+        else:
+            day_ok = dom_match and dow_match
 
         return (
             (now.minute in m_set)
             and (now.hour in h_set)
-            and (now.day in dom_set)
             and (now.month in mon_set)
-            and (cron_dow in dow_set)
+            and day_ok
         )
     except Exception:
         return False
@@ -242,12 +245,13 @@ def get_next_cron_time(
     return None
 
 
-async def _run_standard_backup_via_client(client):
+async def _run_standard_backup_via_client():
     """
     无消息上下文的标准备份：打包 data+plugins（默认排除 session），
     如配置允许（upload_sessions=True）则同时生成 sessions 包。
     上传逻辑：若存在目标ID且>1，先上传到收藏夹再转发，以节省重复上传。
     """
+    client = bot
     program_dir = get_program_dir()
     data_dir = os.path.join(program_dir, "data")
     plugins_dir = os.path.join(program_dir, "plugins")
@@ -308,7 +312,7 @@ async def _run_standard_backup_via_client(client):
                     sent_s = await client.send_file(
                         "me",
                         sessions_created,
-                        caption="🔐 会话（session）备份 — 请妖善保管（敏感）",
+                        caption="🔐 会话（session）备份 — 请妥善保管（敏感）",
                     )
                     for tgt in targets:
                         try:
@@ -317,7 +321,7 @@ async def _run_standard_backup_via_client(client):
                             await client.send_file(
                                 int(tgt),
                                 sessions_created,
-                                caption="🔐 会话（session）备份 — 请妖善保管（敏感）",
+                                caption="🔐 会话（session）备份 — 请妥善保管（敏感）",
                             )
         else:
             # 无目标则发送到收藏夹
@@ -326,7 +330,7 @@ async def _run_standard_backup_via_client(client):
                 await client.send_file(
                     "me",
                     sessions_created,
-                    caption="🔐 会话（session）备份 — 请妖善保管（敏感）",
+                    caption="🔐 会话（session）备份 — 请妥善保管（敏感）",
                 )
     finally:
         # 清理临时文件
@@ -343,56 +347,33 @@ async def _run_standard_backup_via_client(client):
 
 
 async def _cron_loop():
-    global _last_cron_minute_done
-    while True:
-        try:
-            expr = get_cron_expr()
-            if not expr:
-                # 未配置，稍后重查
-                await asyncio.sleep(30)
-                continue
-            now = now_bj()
-            key = now.strftime("%Y%m%d%H%M")
-            if _cron_matches(now, expr) and _last_client is not None:
-                # 避免同一分钟重复
-                if _last_cron_minute_done != key:
-                    _last_cron_minute_done = key
-                    try:
-                        await _run_standard_backup_via_client(_last_client)
-                        # 记录最近一次触发时间
-                        set_cron_last_run(now.strftime("%Y-%m-%d %H:%M:%S"))
-                    except Exception:
-                        pass
-            # 10s 粒度检查
-            await asyncio.sleep(10)
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            # 出错不退出
-            await asyncio.sleep(10)
+    expr = get_cron_expr()
+    if not expr:
+        # 未配置
+        return
+    now = now_bj()
+    if not _cron_matches(now, expr):
+        return
+    await _run_standard_backup_via_client()
+    # 记录最近一次触发时间
+    set_cron_last_run(now.strftime("%Y-%m-%d %H:%M:%S"))
 
 
-def _restart_cron_task():
-    """根据当前配置重启后台定时任务循环"""
-    global _cron_task
-    try:
-        if _cron_task and not _cron_task.done():
-            _cron_task.cancel()
-    except Exception:
-        pass
-    loop = None
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        try:
-            loop = asyncio.get_event_loop()
-        except Exception:
-            loop = None
-    if loop and loop.is_running():
-        _cron_task = loop.create_task(_cron_loop())
-    else:
-        # 若当前尚未运行事件循环，稍后在首次命令调用时再启动
-        _cron_task = None
+@Hook.load_success()
+async def _restart_cron_task():
+    """在插件加载完成后添加定时任务"""
+    expr = get_cron_expr()
+    if expr and not scheduler.get_job("bf_cron_task"):
+        scheduler.add_job(
+            _cron_loop,
+            "cron",
+            minute="*",
+            id="bf_cron_task",
+            name="bf_cron_task",
+        )
+    elif not expr and scheduler.get_job("bf_cron_task"):
+        # 如果没有配置则移除任务
+        scheduler.remove_job("bf_cron_task")
 
 
 # 目标聊天ID管理（支持多目标）
@@ -718,23 +699,34 @@ def create_secure_temp_file(suffix=".tar.gz"):
     return temp_path
 
 
+def check_backup_size(file_path, max_size_mb=100):
+    """检查备份文件大小"""
+    if os.path.exists(file_path):
+        size_mb = os.path.getsize(file_path) / 1024 / 1024
+        if size_mb > max_size_mb:
+            return False, f"备份文件过大: {size_mb:.1f}MB > {max_size_mb}MB"
+        return True, f"文件大小: {size_mb:.1f}MB"
+    return False, "文件不存在"
+
+
 def create_backup_info(backup_type, file_list=None):
     """创建备份元数据信息"""
-    backup_info = {
+    import sys
+
+    return {
         "version": "1.0",
-        "created_at": now_bj().isoformat(),
         "backup_type": backup_type,
-        "pagermaid_version": "unknown",  # 可以后续添加版本检测
-        "python_version": f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}",
+        "created_at": now_bj().isoformat(),
+        "created_by": "bf_plugin",
         "file_count": len(file_list) if file_list else 0,
         "files": file_list or [],
-        "security_checks": {
-            "path_validation": True,
-            "safe_extraction": True,
-            "whitelist_dirs": ["plugins", "data", "pagermaid_backup"],
-        },
+        "platform": os.name,
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "backup_format": "tar.gz",
+        "compression_level": 5,
+        "exclude_sessions": True,
+        "security_validated": True,
     }
-    return backup_info
 
 
 def add_backup_info_to_archive(tar_path, backup_info):
@@ -776,12 +768,9 @@ def read_backup_info(tar_path):
 
 # bf 备份命令
 @listener(command="bf", description="备份主命令，支持多种备份模式", need_admin=True)
-async def bf(bot, message: Message):
+async def bf(message: Message):
     param = message.parameter
     program_dir = get_program_dir()
-    # 捕获 client 以供定时任务使用
-    global _last_client
-    _last_client = message.client
 
     if param and param[0] in ["help", "帮助"]:
         help_text = (
@@ -895,7 +884,7 @@ async def bf(bot, message: Message):
                 "• 设置定时：`bf cron <m h dom mon dow>`（5 段国际标准）\n\n"
                 f"当前设置：{cur if cur else '未设置'}\n"
                 f"最近一次触发：{last if last else '—'}\n"
-                f"下次预计触发：{nxt if cur else '—'}\n\n"
+                f"下次预计触发：{nxt if nxt != '—' else '—'}\n\n"
                 "语法说明：\n"
                 "• * 任意值  • a-b 范围  • a,b 列表  • */n 步进  • a-b/n 组合\n"
                 "• 星期取值 0-6（0=周日）\n\n"
@@ -927,7 +916,7 @@ async def bf(bot, message: Message):
             return
         if sub.lower() == "off":
             set_cron_expr(None)
-            _restart_cron_task()
+            await _restart_cron_task()
             await message.edit("已关闭定时备份")
             return
         # 其余视为表达式
@@ -947,7 +936,7 @@ async def bf(bot, message: Message):
             await message.edit(f"表达式解析失败：{str(e)}")
             return
         set_cron_expr(sub)
-        _restart_cron_task()
+        await _restart_cron_task()
         nxt_dt = get_next_cron_time(sub)
         nxt = nxt_dt.strftime("%Y-%m-%d %H:%M") if nxt_dt else "—"
         await message.edit(
@@ -959,7 +948,6 @@ async def bf(bot, message: Message):
     if param and param[0] == "all":
         try:
             await message.edit("🔄 正在创建完整程序备份...")
-
             # 生成智能包名
             package_name = generate_smart_package_name("full")
             backup_filename = f"{package_name}.tar.gz"
@@ -1091,7 +1079,6 @@ async def bf(bot, message: Message):
     if param and param[0] == "p":
         try:
             await message.edit("🐍 正在创建Python插件备份...")
-
             # 生成智能包名
             package_name = generate_smart_package_name("plugins")
             backup_filename = f"{package_name}.tar.gz"
@@ -1234,7 +1221,8 @@ async def bf(bot, message: Message):
                     await message.client.send_file(
                         int(targets[0]),
                         sessions_created,
-                        caption="🔐 会话（session）备份 — 请妖善保管（敏感）",
+                        caption="🔐 会话（session）备份 — 请妥善保管（敏感）",
+                        force_document=True,
                     )
             else:
                 sent_msg = await message.client.send_file(
@@ -1251,7 +1239,7 @@ async def bf(bot, message: Message):
                     sent_s = await message.client.send_file(
                         "me",
                         sessions_created,
-                        caption="🔐 会话（session）备份 — 请妖善保管（敏感）",
+                        caption="🔐 会话（session）备份 — 请妥善保管（敏感）",
                         force_document=True,
                     )
                     for tgt in targets:
@@ -1263,7 +1251,7 @@ async def bf(bot, message: Message):
                             await message.client.send_file(
                                 int(tgt),
                                 sessions_created,
-                                caption="🔐 会话（session）备份 — 请妖善保管（敏感）",
+                                caption="🔐 会话（session）备份 — 请妥善保管（敏感）",
                                 force_document=True,
                             )
         else:
@@ -1274,7 +1262,7 @@ async def bf(bot, message: Message):
                 await message.client.send_file(
                     "me",
                     sessions_created,
-                    caption="🔐 会话（session）备份 — 请妖善保管（敏感）",
+                    caption="🔐 会话（session）备份 — 请妥善保管（敏感）",
                     force_document=True,
                 )
 
@@ -1308,7 +1296,7 @@ async def bf(bot, message: Message):
 
 # hf 恢复命令
 @listener(command="hf", description="恢复备份命令，支持确认模式")
-async def hf(bot, message: Message):
+async def hf(message: Message):
     param = message.parameter
 
     # 检查是否有确认参数
@@ -1499,8 +1487,10 @@ async def hf(bot, message: Message):
             files = [p for p in top_items if os.path.isfile(p)]
             if len(dirs) == 1 and not files:
                 final_backup_folder = dirs[0]
-            else:
+            elif {"data", "plugins"} & {os.path.basename(d) for d in dirs}:
                 final_backup_folder = temp_extract_dir
+            else:
+                raise Exception("备份包结构异常：缺少 data/plugins 目录")
 
         # 恢复前自动创建一次当前状态的标准全备份（data+plugins）到收藏夹
         try:
