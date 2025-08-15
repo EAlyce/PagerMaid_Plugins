@@ -11,7 +11,11 @@ from pagermaid.services import sqlite as db
 from pagermaid.utils import alias_command, pip_install
 
 from PIL import Image
-from telethon.errors import MessageTooLongError
+from telethon.errors import MessageTooLongError, MessageEmptyError
+from telethon.extensions import html as tg_html
+from telethon.tl.types import (
+    MessageEntityBlockquote, MessageEntityItalic, MessageEntityBold
+)
 
 # Dependencies
 dependencies = {
@@ -28,10 +32,10 @@ for module, package in dependencies.items():
         pip_install(package)
 
 import markdown
-from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
 from telegraph import Telegraph
+from bs4 import BeautifulSoup
 
 # --- Constants ---
 DB_PREFIX = "custom.gemini."
@@ -49,6 +53,7 @@ DB_TELEGRAPH_ENABLED = f"{DB_PREFIX}telegraph_enabled"
 DB_TELEGRAPH_LIMIT = f"{DB_PREFIX}telegraph_limit"
 DB_TELEGRAPH_TOKEN = f"{DB_PREFIX}telegraph_token"
 DB_TELEGRAPH_POSTS = f"{DB_PREFIX}telegraph_posts"
+DB_COLLAPSIBLE_QUOTE_ENABLED = f"{DB_PREFIX}collapsible_quote_enabled"
 DB_BASE_URL = f"{DB_PREFIX}base_url"
 
 DEFAULT_CHAT_MODEL = "gemini-2.0-flash"
@@ -89,6 +94,21 @@ def _get_telegraph_client():
 
 # --- Helper Functions ---
 
+def _sanitize_html_for_telegraph(html_content: str) -> str:
+    """Sanitizes HTML to prevent invalid tag errors from Telegraph by escaping unknown tags."""
+    # Based on https://telegra.ph/api#Available-tags
+    ALLOWED_TAGS = {
+        'a', 'aside', 'b', 'blockquote', 'br', 'code', 'em', 'figcaption',
+        'figure', 'h3', 'h4', 'hr', 'i', 'iframe', 'img', 'li', 'ol', 'p',
+        'pre', 's', 'strong', 'u', 'ul', 'video'
+    }
+    soup = BeautifulSoup(html_content, 'html.parser')
+    for tag in soup.find_all(True):
+        if tag.name not in ALLOWED_TAGS:
+            tag.unwrap()
+    return str(soup)
+
+
 async def _send_usage(message: Message, command: str, usage: str):
     """Sends a formatted usage message."""
     await message.edit(f"<b>用法:</b> <code>,{alias_command('gemini')} {command} {usage}</code>", parse_mode='html')
@@ -103,6 +123,11 @@ def _censor_url(url: str) -> str:
     if not url:
         return "默认"
     return re.sub(r'(?<=//)[^/]+', '***', url)
+
+
+def _get_utf16_length(text: str) -> int:
+    """Calculates the length of a string in UTF-16 code units."""
+    return len(text.encode('utf-16-le')) // 2
 
 def _get_prompt_text_for_display(message: Message, args: str) -> str:
     """Gets the primary text prompt for display purposes."""
@@ -342,6 +367,7 @@ async def _handle_settings(message: Message, args: str):
     context_enabled = db.get(DB_CONTEXT_ENABLED, False)
     telegraph_enabled = db.get(DB_TELEGRAPH_ENABLED, False)
     telegraph_limit = db.get(DB_TELEGRAPH_LIMIT, 0)
+    collapsible_quote_enabled = db.get(DB_COLLAPSIBLE_QUOTE_ENABLED, False)
     base_url = db.get(DB_BASE_URL)
     censored_base_url = _censor_url(base_url)
     settings_text = (
@@ -355,7 +381,8 @@ async def _handle_settings(message: Message, args: str):
         f"<b>· 生成 Token 最大数量:</b> <code>{max_tokens if max_tokens > 0 else '无限制'}</code>\n"
         f"<b>· 上下文已启用:</b> <code>{context_enabled}</code>\n"
         f"<b>· Telegraph 已启用:</b> <code>{telegraph_enabled}</code>\n"
-        f"<b>· Telegraph 限制:</b> <code>{telegraph_limit if telegraph_limit > 0 else '无限制'}</code>"
+        f"<b>· Telegraph 限制:</b> <code>{telegraph_limit if telegraph_limit > 0 else '无限制'}</code>\n"
+        f"<b>· 折叠引用:</b> <code>{collapsible_quote_enabled}</code>"
     )
     await message.edit(settings_text, parse_mode='html')
 
@@ -523,18 +550,21 @@ async def _handle_context(message: Message, args: str):
         await _send_usage(message, "context", "[on|off|clear|show]")
 
 
-async def _send_to_telegraph(title: str, content: str) -> str | None:
-    """Creates a Telegraph page and returns its URL."""
+async def _send_to_telegraph(title: str, content: str) -> tuple[str | None, str | None]:
+    """Creates a Telegraph page and returns its URL and a potential error message."""
     try:
+        # Telegraph API has a content size limit of 64KB.
+        if len(content.encode('utf-8')) > 64 * 1024:
+            return None, "内容超过 Telegraph 64KB 大小限制"
         client = _get_telegraph_client()
         page = client.create_page(title=title, html_content=content)
         posts = db.get(DB_TELEGRAPH_POSTS, {})
         post_id = str(max(map(int, posts.keys()), default=0) + 1)
         posts[post_id] = {"path": page['path'], "title": title}
         db[DB_TELEGRAPH_POSTS] = posts
-        return page['url']
-    except Exception:
-        return None
+        return page['url'], None
+    except Exception as e:
+        return None, str(e)
 
 
 async def _handle_telegraph(message: Message, args: str):
@@ -682,26 +712,65 @@ async def _handle_telegraph(message: Message, args: str):
         await _send_usage(message, "telegraph", "[on|off|limit|list [page]|del [id|all]|clear]")
 
 
+async def _handle_collapse(message: Message, args: str):
+    """处理 'collapse' 子命令。"""
+    if args == "on":
+        db[DB_COLLAPSIBLE_QUOTE_ENABLED] = True
+        await message.edit("<b>折叠引用已启用。</b>", parse_mode='html')
+    elif args == "off":
+        db[DB_COLLAPSIBLE_QUOTE_ENABLED] = False
+        await message.edit("<b>折叠引用已禁用。</b>", parse_mode='html')
+    else:
+        await _send_usage(message, "collapse", "[on|off]")
+
+
 async def _send_response(message: Message, prompt_text: str, html_output: str, powered_by: str):
     """Formats and sends the final response, handling Telegraph for long messages."""
-    # Final message construction
-    formatted_response = f"🤖<b>回复:</b>\n<blockquote>{html_output}</blockquote>"
-    if prompt_text:
-        question_text = f"👤<b>提示:</b>\n<blockquote>{html.escape(prompt_text)}</blockquote>"
-        final_text = f"{question_text}\n{formatted_response}\n<i>{powered_by}</i>"
-    else:
-        final_text = f"{formatted_response}\n<i>{powered_by}</i>"
+    collapsible_quote_enabled = db.get(DB_COLLAPSIBLE_QUOTE_ENABLED, False)
+    response_text_formatted, response_entities = tg_html.parse(html_output)
 
+    final_text = ""
+    entities = []
+
+    if prompt_text:
+        prompt_header = "👤提示:\n"
+        header_start = _get_utf16_length(final_text)
+        final_text += prompt_header
+        entities.append(MessageEntityBold(offset=header_start, length=_get_utf16_length(prompt_header.strip())))
+        start = _get_utf16_length(final_text)
+        final_text += prompt_text
+        entities.append(MessageEntityBlockquote(offset=start, length=_get_utf16_length(prompt_text),
+                                                  collapsed=collapsible_quote_enabled))
+        final_text += "\n"
+
+    response_header = "🤖回复:\n"
+    header_start = _get_utf16_length(final_text)
+    final_text += response_header
+    entities.append(MessageEntityBold(offset=header_start, length=_get_utf16_length(response_header.strip())))
+    start_quote = _get_utf16_length(final_text)
+    final_text += response_text_formatted
+    entities.append(MessageEntityBlockquote(offset=start_quote, length=_get_utf16_length(response_text_formatted),
+                                              collapsed=collapsible_quote_enabled))
+    for entity in response_entities:
+        entity.offset += start_quote
+    entities.extend(response_entities)
+    final_text += "\n"
+
+    powered_by_text = f"{powered_by}"
+    start = _get_utf16_length(final_text)
+    final_text += powered_by_text
+    entities.append(MessageEntityItalic(offset=start, length=_get_utf16_length(powered_by_text)))
     telegraph_enabled = db.get(DB_TELEGRAPH_ENABLED)
     telegraph_limit = db.get(DB_TELEGRAPH_LIMIT, 0)
 
     # Check for character limit before trying to send the message
     if telegraph_enabled and telegraph_limit > 0 and len(final_text) > telegraph_limit:
         if prompt_text:
-            title = (prompt_text[:15] + '...') if len(prompt_text) > 18 else prompt_text
+            title = f'{prompt_text[:15]}...' if len(prompt_text) > 18 else prompt_text
         else:
             title = "Gemini 回复"
-        url = await _send_to_telegraph(title, html_output)
+        sanitized_html = _sanitize_html_for_telegraph(html_output)
+        url, error = await _send_to_telegraph(title, sanitized_html)
         if url:
             telegraph_link_text = (f"🤖<b>回复:</b>\n"
                                    f"<b>回复超过 {telegraph_limit} 字符，已上传到 Telegraph:</b>\n {url}")
@@ -712,18 +781,22 @@ async def _send_response(message: Message, prompt_text: str, html_output: str, p
                 final_telegraph_text = f"{telegraph_link_text}\n<i>{powered_by}</i>"
             await message.edit(final_telegraph_text, parse_mode='html', link_preview=True)
         else:
-            await _show_error(message, "输出超过字符限制，上传到 Telegraph 失败。")
+            error_msg = f"上传到 Telegraph 失败: {error}" if error else "上传到 Telegraph 失败。"
+            await _show_error(message, error_msg)
         return
 
     try:
-        await message.edit(final_text, parse_mode='html', link_preview=False)
+        await message.edit(final_text, formatting_entities=entities, link_preview=False)
+    except MessageEmptyError:
+        await _show_error(message, "模型返回了空的或无效的回复，无法发送。")
     except MessageTooLongError:
         if telegraph_enabled:
             if prompt_text:
                 title = f"{(prompt_text[:15] + '...') if len(prompt_text) > 18 else prompt_text}"
             else:
                 title = "Gemini 回复"
-            url = await _send_to_telegraph(title, html_output)
+            sanitized_html = _sanitize_html_for_telegraph(html_output)
+            url, error = await _send_to_telegraph(title, sanitized_html)
             if url:
                 telegraph_link_text = (f"<b>回复超过 Telegram 消息最大字符数，已上传到 Telegraph:</b>\n {url}")
                 response_text = (f"🤖<b>回复:</b>\n"
@@ -735,7 +808,8 @@ async def _send_response(message: Message, prompt_text: str, html_output: str, p
                     final_telegraph_text = telegraph_link_text
                 await message.edit(final_telegraph_text, parse_mode='html', link_preview=True)
             else:
-                await _show_error(message, "输出过长，上传到 Telegraph 失败。")
+                error_msg = f"上传到 Telegraph 失败: {error}" if error else "上传到 Telegraph 失败。"
+                await _show_error(message, error_msg)
         else:
             await _show_error(message, "输出过长。启用 Telegraph 集成以链接形式发送。")
 
@@ -764,7 +838,16 @@ async def _execute_gemini_request(message: Message, args: str, use_search: bool)
     if output_text is None:
         return
 
-    html_output = markdown.markdown(output_text)
+    html_output = markdown.markdown(output_text, extensions=['fenced_code'])
+
+    # Replace unsupported h1/h2/h5/h6 tags with h3/h4 for Telegraph compatibility
+    soup = BeautifulSoup(html_output, "html.parser")
+    for tag in soup.find_all(['h1', 'h2']):
+        tag.name = 'h3'
+    for tag in soup.find_all(['h5', 'h6']):
+        tag.name = 'h4'
+    html_output = str(soup)
+
     prompt_text = _get_prompt_text_for_display(message, args)
     await _send_response(message, prompt_text, html_output, powered_by)
 
@@ -804,19 +887,40 @@ async def _handle_image(message: Message, args: str):
         powered_by = "由 Gemini 图片生成强力驱动"
 
         # Build caption
-        caption_parts = []
+        collapsible_quote_enabled = db.get(DB_COLLAPSIBLE_QUOTE_ENABLED, False)
+        final_caption = ""
+        entities = []
+
         if prompt_text:
-            caption_parts.append(f"👤<b>提示:</b>\n<blockquote>{html.escape(prompt_text)}</blockquote>\n")
+            prompt_header = "👤提示:\n"
+            header_start = _get_utf16_length(final_caption)
+            final_caption += prompt_header
+            entities.append(MessageEntityBold(offset=header_start, length=_get_utf16_length(prompt_header.strip())))
+            start = _get_utf16_length(final_caption)
+            final_caption += prompt_text
+            entities.append(MessageEntityBlockquote(offset=start, length=_get_utf16_length(prompt_text), collapsed=collapsible_quote_enabled))
+            final_caption += "\n"
+
         if text_response:
-            caption_parts.append(f"🤖<b>回复:</b>\n<blockquote>{html.escape(text_response)}</blockquote>")
-        caption_parts.append(f"<i>{powered_by}</i>")
-        final_caption = "".join(caption_parts)
+            response_header = "🤖回复:\n"
+            header_start = _get_utf16_length(final_caption)
+            final_caption += response_header
+            entities.append(MessageEntityBold(offset=header_start, length=_get_utf16_length(response_header.strip())))
+            start_quote = _get_utf16_length(final_caption)
+            final_caption += text_response
+            entities.append(MessageEntityBlockquote(offset=start_quote, length=_get_utf16_length(text_response), collapsed=collapsible_quote_enabled))
+            final_caption += "\n"
+
+        powered_by_text = f"{powered_by}"
+        start = _get_utf16_length(final_caption)
+        final_caption += powered_by_text
+        entities.append(MessageEntityItalic(offset=start, length=_get_utf16_length(powered_by_text)))
 
         await message.client.send_file(
             message.chat_id,
             file=image_stream,
             caption=final_caption,
-            parse_mode='html',
+            caption_entities=entities,
             link_preview=False,
             reply_to=message.id
         )
@@ -845,6 +949,7 @@ Google Gemini AI 插件。需要 PagerMaid-Modify 1.5.8 及以上版本。
 - `gemini set_api_key [key]`: 设置您的 Gemini API 密钥。
 - `gemini set_base_url [url]`: 设置自定义 Gemini API 基础 URL。留空以清除。
 - `gemini max_tokens [number]`: 设置最大输出 token 数 (0 表示无限制)。
+- `gemini collapse [on|off]`: 开启或关闭折叠引用。
 
 模型管理:
 - `gemini model list`: 列出可用模型。
@@ -887,6 +992,7 @@ async def gemini(message: Message):
         "image": _handle_image,
         "context": _handle_context,
         "telegraph": _handle_telegraph,
+        "collapse": _handle_collapse,
     }
 
     try:
